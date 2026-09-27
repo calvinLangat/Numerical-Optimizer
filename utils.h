@@ -35,6 +35,10 @@ void MatSubSame(double* A, double* B, size_t n);
 
 void MatVecMul(double* A, const double* b, double* c, size_t n);
 
+void MatVecMulTranspose(double* A, const double* b, double* c, size_t n);
+
+void MatVecMulTransposeRect(const double* A, const double* b, double* c, size_t rows, size_t cols);
+
 void VecSub(double* a, double* b, double* c, size_t n);
 
 void VecAdd(double* a, double* b, size_t n);
@@ -49,8 +53,20 @@ void OuterProduct(const double* a, const double* b, size_t n, double* Mat);
 
 void CreateIdentityMat(double* A, size_t rows);
 
-int CreateArena(ARENA** arena, size_t size);
+void CreateDiagonalMat(double* A, double* b, size_t rows);
 
-void DestroyArena(ARENA* arena);
 
-char* ArenaAlloc(ARENA* arena, size_t size);
+/* A: row-major n-by-n matrix; overwritten with R.
+ * b: right-hand side; unchanged.
+ * c: output array of n doubles; receives x.
+ *
+ * A, b, and c must not overlap.
+ *
+ * Returns:
+ *   0  success
+ *  -1  invalid arguments
+ *  -2  allocation failed
+ *  -3  singular matrix
+ */
+int Householder_solve(double *A, const double *b, double *c, int n);
+

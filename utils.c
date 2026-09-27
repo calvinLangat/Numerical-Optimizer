@@ -77,6 +77,36 @@ void MatVecMul(double* A, const double* b, double* c, size_t n)
 	}
 }
 
+void MatVecMulTranspose(double* A, const double* b, double* c, size_t n)
+{
+	for (int i = 0; i < n; ++i)
+	{
+		c[i] = 0;
+		for (int j = 0; j < n; ++j)
+		{
+			c[i] += A[j * n + i] * b[j];
+		}
+	}
+}
+
+void MatVecMulTransposeRect(
+    const double* A,
+    const double* b,
+    double* c,
+    size_t rows,
+    size_t cols)
+{
+    for (size_t i = 0; i < cols; ++i)
+    {
+        c[i] = 0.0;
+
+        for (size_t j = 0; j < rows; ++j)
+        {
+            c[i] += A[j * cols + i] * b[j];
+        }
+    }
+}
+
 double Dot(const double* a, const double* b, size_t n)
 {
 	double sum = 0.0;
@@ -151,42 +181,106 @@ void CreateIdentityMat(double* A, size_t rows)
 	}
 }
 
-int CreateArena(ARENA** arena, size_t size)
+void CreateDiagonalMat(double* A, double* b, size_t rows)
 {
-	ARENA* ar = *arena;
-	ar->chunk = malloc(size);
-	if (ar->chunk)
+	for(int i=0; i<rows;++i)
 	{
-		ar->size = size;
-		ar->idx = ar->chunk;
-		ar->used = 0;
-		return 0;
-	}
-	return -1;	//failed malloc
-}
-
-void DestroyArena(ARENA* arena)
-{
-	free(arena->chunk);
-	arena->chunk = NULL;
-	arena->idx   = NULL;
-	arena->size  = 0;
-	arena->used  = 0;
-}
-
-char* ArenaAlloc(ARENA* arena, size_t size)
-{
-	if ((arena->size - arena->used) >= size)
-	{
-		char* pos = NULL;
-		pos = arena->idx;
-		arena->used += size;
-		arena->idx  += size;
-		return pos;
-	}
-	else
-	{
-		return NULL;
+		A[i * rows + i] = b[i];
 	}
 }
 
+/* A: row-major n-by-n matrix; overwritten with R.
+ * b: right-hand side; unchanged.
+ * c: output array of n doubles; receives x.
+ *
+ * A, b, and c must not overlap.
+ *
+ * Returns:
+ *   0  success
+ *  -1  invalid arguments
+ *  -2  allocation failed
+ *  -3  singular matrix
+ */
+int Householder_solve(double *A, const double *b, double *c, int n)
+{
+    if (A == NULL || b == NULL || c == NULL || n <= 0)
+        return -1;
+
+    size_t N = (size_t)n;
+    double *v = malloc(N * sizeof(*v));
+    if (v == NULL)
+        return -2;
+
+    for (int i = 0; i < n; ++i)
+        c[i] = b[i];
+
+    for (int k = 0; k < n - 1; ++k) {
+        /* Construct the reflector vector. */
+        double norm = 0.0;
+        for (int i = k; i < n; ++i) {
+            v[i] = A[(size_t)i * N + k];
+            norm = hypot(norm, v[i]);
+        }
+
+        if (norm == 0.0) {
+            free(v);
+            return -3;
+        }
+
+        double alpha = (v[k] >= 0.0) ? -norm : norm;
+
+        /* Scaling v does not change the reflection. */
+        for (int i = k; i < n; ++i)
+            v[i] /= norm;
+
+        v[k] -= alpha / norm;
+
+        double vv = 0.0;
+        for (int i = k; i < n; ++i)
+            vv += v[i] * v[i];
+
+        double tau = 2.0 / vv;
+
+        /* Transform the remaining columns. */
+        for (int j = k + 1; j < n; ++j) {
+            double dot = 0.0;
+            for (int i = k; i < n; ++i)
+                dot += v[i] * A[(size_t)i * N + j];
+
+            double s = tau * dot;
+            for (int i = k; i < n; ++i)
+                A[(size_t)i * N + j] -= s * v[i];
+        }
+
+        /* Transform the working right-hand side in c. */
+        double dot = 0.0;
+        for (int i = k; i < n; ++i)
+            dot += v[i] * c[i];
+
+        double s = tau * dot;
+        for (int i = k; i < n; ++i)
+            c[i] -= s * v[i];
+
+        A[(size_t)k * N + k] = alpha;
+        for (int i = k + 1; i < n; ++i)
+            A[(size_t)i * N + k] = 0.0;
+    }
+
+    free(v);
+
+    /* Back substitution: c becomes the solution. */
+    for (int i = n - 1; i >= 0; --i) {
+        double diagonal = A[(size_t)i * N + i];
+
+        if (diagonal == 0.0)
+            return -3;
+
+        double sum = 0.0;
+        for (int j = i + 1; j < n; ++j)
+            sum += A[(size_t)i * N + j] * c[j];
+
+        c[i] = (c[i] - sum) / diagonal;
+    }
+
+    return 0;
+}
