@@ -173,12 +173,13 @@ void OuterProduct(const double* a, const double* b, size_t n, double* Mat)
 
 void CreateIdentityMat(double* A, size_t rows)
 {
-	int j = 0;
-	for (int i = 0; i < rows; ++i)
-	{
-		A[i * rows + j] = 1;
-		++j;
-	}
+	for (size_t i = 0; i < rows; ++i)
+    {
+        for (size_t j = 0; j < rows; ++j)
+        {
+            A[i*rows + j] = (i == j) ? 1.0 : 0.0;
+        }
+    }
 }
 
 void CreateDiagonalMat(double* A, double* b, size_t rows)

@@ -10,6 +10,9 @@ int InitializeConstrainInfo(ConstraintInfo* constInfo)
 	constInfo->Usize = sizeofU * sizeofU;
 	constInfo->rSize = sizeofU;
 
+	constInfo->last_x = malloc(constInfo->numVarsFunc * sizeof(double));
+	res |= (constInfo->last_x == NULL);
+
 	constInfo->lambdas = malloc(constInfo->numEqualityConst * sizeof(double));
 	res |= (constInfo->lambdas == NULL);
 
@@ -21,6 +24,9 @@ int InitializeConstrainInfo(ConstraintInfo* constInfo)
 
 	constInfo->gradWRTvars = malloc(constInfo->numVarsFunc * sizeof(double));
 	res |= (constInfo->gradWRTvars == NULL);
+
+	constInfo->last_gradWRTvars = malloc(constInfo->numVarsFunc * sizeof(double));
+	res |= (constInfo->last_gradWRTvars == NULL);
 
 	constInfo->gradWRTlambda = malloc(constInfo->numEqualityConst * sizeof(double));
 	res |= (constInfo->gradWRTlambda == NULL);
@@ -43,6 +49,12 @@ int InitializeConstrainInfo(ConstraintInfo* constInfo)
 	constInfo->DiagSlacks = malloc(constInfo->numInEqualityConst * constInfo->numInEqualityConst * sizeof(double));
 	res |= (constInfo->DiagSlacks == NULL);
 
+	constInfo->s = malloc(constInfo->numVarsFunc * sizeof(double));
+	res |= (constInfo->s == NULL);
+
+	constInfo->y = malloc(constInfo->numVarsFunc * sizeof(double));
+	res |= (constInfo->y == NULL);
+
 	constInfo->U = malloc(sizeofU * sizeofU * sizeof(double));
 	res |= (constInfo->U == NULL);
 
@@ -54,7 +66,7 @@ int InitializeConstrainInfo(ConstraintInfo* constInfo)
 
 
 	for (size_t i = 0; i < constInfo->numEqualityConst; ++i)
-    constInfo->lambdas[i] = 0.0;
+    	constInfo->lambdas[i] = 0.0;
 
 	for (size_t i = 0; i < constInfo->numInEqualityConst; ++i)
 	{
@@ -62,10 +74,12 @@ int InitializeConstrainInfo(ConstraintInfo* constInfo)
 	    constInfo->slacks[i] = 0.5;
 	}
 
+	CreateIdentityMat(constInfo->Hessian, constInfo->numVarsFunc);
+
 	for (size_t i = 0; i < sizeofU; ++i)
 	    constInfo->step[i] = 0.0;
 
-
+	constInfo->hasPreviousX = 0;
 	return res;
 }
 
@@ -82,6 +96,9 @@ void FreeConstrainInfo(ConstraintInfo* constInfo)
 	free(constInfo->gradWRTlambda);
 	free(constInfo->gradWRTsigma);
 	free(constInfo->gradWRTslack);
+
+	free(constInfo->s);
+	free(constInfo->y);
 
 	free(constInfo->Hessian);
 	free(constInfo->JacWRTlambda);
@@ -429,6 +446,95 @@ void CreateVecR(ConstraintInfo* constInfo)
 	VecScalarMult(constInfo->r, -1, constInfo->rSize);
 }
 
+int ComputeLagrangianHessianWRTvars(ConstraintInfo* constInfo)
+{
+	const size_t n = constInfo->numVarsFunc;
+    // First call: there is no previous displacement to learn from.
+    if (!constInfo->hasPreviousX)
+    {
+        for (size_t i = 0; i < n; ++i)
+            constInfo->last_x[i] = constInfo->x0[i];
+
+        constInfo->hasPreviousX = 1;
+        return 1;  // No update.
+    }
+
+    // Actual displacement between accepted points.
+    VecSub(
+        constInfo->x0,
+        constInfo->last_x,
+        constInfo->s,
+        n);
+
+    VecSub(
+    constInfo->x0,
+    constInfo->last_x,
+    constInfo->s,
+    n);
+
+	double relativeStep = 0.0;
+
+	for (size_t i = 0; i < n; ++i)
+	{
+	    const double scale =
+	        fmax(1.0, fmax(fabs(constInfo->x0[i]),
+	                      fabs(constInfo->last_x[i])));
+
+	    const double change = fabs(constInfo->s[i]) / scale;
+
+	    if (!isfinite(change))
+	        return -2;
+
+	    relativeStep = fmax(relativeStep, change);
+	}
+
+	// Starting value for current finite-difference implementation.
+	const double minimumBfgsStep = 1e-6;
+
+	if (relativeStep <= minimumBfgsStep)
+	{
+	    // Advance the saved point even though B stays unchanged.
+	    for (size_t i = 0; i < n; ++i)
+	        constInfo->last_x[i] = constInfo->x0[i];
+
+	    return 1;  // BFGS update skipped; optimization continues.
+	}
+
+    // Save the current input/output pointers.
+    double* currentX = constInfo->x0;
+    double* currentGradient = constInfo->gradWRTvars;
+
+    // Evaluate at the previous x, using CURRENT multipliers.
+    // Reuse last_gradWRTvars as the output buffer.
+    constInfo->x0 = constInfo->last_x;
+    constInfo->gradWRTvars = constInfo->last_gradWRTvars;
+
+    ComputeGradientLagrangianWRTvars(constInfo);
+
+    // Restore the current input/output pointers.
+    constInfo->x0 = currentX;
+    constInfo->gradWRTvars = currentGradient;
+
+    // Both gradients now use the same multipliers.
+    VecSub(
+        constInfo->gradWRTvars,
+        constInfo->last_gradWRTvars,
+        constInfo->y,
+        n);
+
+    int status = BfgsHessianUpdate(
+        constInfo->Hessian,
+        constInfo->s,
+        constInfo->y,
+        n);
+
+    // Save the current point for the next accepted displacement.
+    for (size_t i = 0; i < n; ++i)
+        constInfo->last_x[i] = constInfo->x0[i];
+
+    return status;
+}
+
 void SolveStep(ConstraintInfo* constInfo)
 {
 	/*
@@ -473,6 +579,207 @@ void ApplyStep(ConstraintInfo* constInfo, double alpha)
         constInfo->sigmas[i] += alpha * constInfo->step[n + m + p + i];
 }
 
+int CalculateStepLength(ConstraintInfo* constInfo)
+{
+    // Returns:
+    //   0: accepted step
+    //  -1: no acceptable step found
+    //  -2: allocation failed
+    //  -3: invalid input or current state
+
+    const size_t n = constInfo->numVarsFunc;
+    const size_t m = constInfo->numInEqualityConst;
+    const size_t p = constInfo->numEqualityConst;
+    const size_t N = constInfo->rSize;
+
+    double alpha = constInfo->alpha;
+    const double c1 = constInfo->c1;
+    int status = -1;
+
+    if (N == 0 || N != n + p + 2*m ||
+        !isfinite(alpha) || alpha <= 0.0 || alpha > 1.0 ||
+        !(c1 > 0.0 && c1 < 1.0) ||
+        constInfo->maxArmijoTests <= 0)
+    {
+        constInfo->alpha = 0.0;
+        return -3;
+    }
+
+    // Each entry points to an existing variable/gradient block.
+    double* values[4] = {
+        constInfo->x0,
+        constInfo->slacks,
+        constInfo->lambdas,
+        constInfo->sigmas
+    };
+
+    double* gradients[4] = {
+        constInfo->gradWRTvars,
+        constInfo->gradWRTslack,
+        constInfo->gradWRTlambda,
+        constInfo->gradWRTsigma
+    };
+
+    const size_t sizes[4] = { n, m, p, m };
+    const size_t offsets[4] = { 0, n, n + m, n + m + p };
+
+    // Store backups in the same order as the Newton direction.
+    double* originalValues = malloc(N * sizeof(double));
+    double* originalGradients = malloc(N * sizeof(double));
+    double* originalR = malloc(N * sizeof(double));
+
+    if (!originalValues || !originalGradients || !originalR)
+    {
+        free(originalValues);
+        free(originalGradients);
+        free(originalR);
+
+        constInfo->alpha = 0.0;
+        return -2;
+    }
+
+    for (size_t block = 0; block < 4; ++block)
+    {
+        for (size_t j = 0; j < sizes[block]; ++j)
+        {
+            const size_t k = offsets[block] + j;
+
+            originalValues[k] = values[block][j];
+            originalGradients[k] = gradients[block][j];
+        }
+    }
+
+    double M_current = 0.0;
+
+    for (size_t i = 0; i < N; ++i)
+    {
+        originalR[i] = constInfo->r[i];
+        M_current += originalR[i] * originalR[i];
+    }
+
+    M_current *= 0.5;
+
+    if (!isfinite(M_current) || M_current <= 0.0)
+    {
+        // Convergence should be checked before calling this function.
+        status = -3;
+        goto restore;
+    }
+
+    for (size_t i = 0; i < N; ++i)
+    {
+        if (!isfinite(originalValues[i]) ||
+            !isfinite(constInfo->step[i]))
+        {
+            status = -3;
+            goto restore;
+        }
+    }
+
+    for (size_t j = 0; j < m; ++j)
+    {
+        if (originalValues[n + j] <= 0.0 ||
+            originalValues[n + m + p + j] <= 0.0)
+        {
+            status = -3;
+            goto restore;
+        }
+    }
+
+    // alpha arrives already capped for positivity.
+    for (int attempt = 0;
+         attempt < constInfo->maxArmijoTests;
+         ++attempt)
+    {
+        int validTrial = 1;
+        int changed = 0;
+
+        // Every trial starts from the saved original point.
+        for (size_t block = 0; block < 4; ++block)
+        {
+            for (size_t j = 0; j < sizes[block]; ++j)
+            {
+                const size_t k = offsets[block] + j;
+
+                const double trial =
+                    originalValues[k] + alpha * constInfo->step[k];
+
+                values[block][j] = trial;
+
+                if (!isfinite(trial))
+                    validTrial = 0;
+
+                // Blocks 1 and 3 are slacks and inequality multipliers.
+                if ((block == 1 || block == 3) && !(trial > 0.0))
+                    validTrial = 0;
+
+                if (trial != originalValues[k])
+                    changed = 1;
+            }
+        }
+
+        // Smaller steps cannot help once the entire update rounds away.
+        if (!changed)
+            break;
+
+        if (validTrial)
+        {
+            ComputeGradientLagrangianWRTvars(constInfo);
+            ComputeGradientLagrangianWRTslack(constInfo);
+            ComputeGradientLagrangianWRTlambda(constInfo);
+            ComputeGradientLagrangianWRTsigma(constInfo);
+            CreateVecR(constInfo);
+
+            double M_trial = 0.0;
+
+            for (size_t i = 0; i < N; ++i)
+                M_trial += constInfo->r[i] * constInfo->r[i];
+
+            M_trial *= 0.5;
+
+            const double threshold =
+                (1.0 - c1 * alpha) * M_current;
+
+            if (isfinite(M_trial) &&
+                M_trial < M_current &&
+                M_trial <= threshold)
+            {
+                status = 0;
+                break;
+            }
+        }
+
+        alpha *= 0.7;
+
+        if (alpha <= 0.0)
+            break;
+    }
+
+restore:
+    // This function selects alpha; the caller applies the step.
+    for (size_t block = 0; block < 4; ++block)
+    {
+        for (size_t j = 0; j < sizes[block]; ++j)
+        {
+            const size_t k = offsets[block] + j;
+
+            values[block][j] = originalValues[k];
+            gradients[block][j] = originalGradients[k];
+        }
+    }
+
+    for (size_t i = 0; i < N; ++i)
+        constInfo->r[i] = originalR[i];
+
+    constInfo->alpha = (status == 0) ? alpha : 0.0;
+
+    free(originalValues);
+    free(originalGradients);
+    free(originalR);
+
+    return status;
+}
+
 int OptimizeConstrained(ConstraintInfo* constInfo)
 {
 	double len = 0;
@@ -488,6 +795,7 @@ int OptimizeConstrained(ConstraintInfo* constInfo)
 		// ComputeGradientLagrangianWRTslack(constInfo);
 		// ComputeGradientLagrangianWRTlambda(constInfo);
 		// ComputeGradientLagrangianWRTsigma(constInfo);
+		// ComputeLagrangianHessianWRTvars(constInfo);
 		// ComputeJacobianLagrangainWRTlambda(constInfo);
 		// ComputeJacobianLagrangainWRTsigma(constInfo);
 		// CreateMatrixU(constInfo);
@@ -499,36 +807,38 @@ int OptimizeConstrained(ConstraintInfo* constInfo)
 		printf("mu = %.10g\n\n", constInfo->mu);
 
 		ComputeGradientLagrangianWRTvars(constInfo);
-		PrintVector("gradWRTvars", constInfo->gradWRTvars,
-		    constInfo->numVarsFunc);
+		// PrintVector("gradWRTvars", constInfo->gradWRTvars,
+		//     constInfo->numVarsFunc);
 
 		ComputeGradientLagrangianWRTslack(constInfo);
-		PrintVector("gradWRTslack", constInfo->gradWRTslack,
-		    constInfo->numInEqualityConst);
+		// PrintVector("gradWRTslack", constInfo->gradWRTslack,
+		//     constInfo->numInEqualityConst);
 
 		ComputeGradientLagrangianWRTlambda(constInfo);
-		PrintVector("gradWRTlambda", constInfo->gradWRTlambda,
-		    constInfo->numEqualityConst);
+		// PrintVector("gradWRTlambda", constInfo->gradWRTlambda,
+		//     constInfo->numEqualityConst);
 
 		ComputeGradientLagrangianWRTsigma(constInfo);
-		PrintVector("gradWRTsigma", constInfo->gradWRTsigma,
-		    constInfo->numInEqualityConst);
+		//PrintVector("gradWRTsigma", constInfo->gradWRTsigma,
+		//    constInfo->numInEqualityConst);
+
+		ComputeLagrangianHessianWRTvars(constInfo);
 
 		ComputeJacobianLagrangainWRTlambda(constInfo);
-		PrintMatrix("JacWRTlambda", constInfo->JacWRTlambda,
-		    constInfo->numEqualityConst, constInfo->numVarsFunc);
+		//PrintMatrix("JacWRTlambda", constInfo->JacWRTlambda,
+		//    constInfo->numEqualityConst, constInfo->numVarsFunc);
 
 		ComputeJacobianLagrangainWRTsigma(constInfo);
-		PrintMatrix("JacWRTsigma", constInfo->JacWRTsigma,
-		    constInfo->numInEqualityConst, constInfo->numVarsFunc);
+		//PrintMatrix("JacWRTsigma", constInfo->JacWRTsigma,
+		//    constInfo->numInEqualityConst, constInfo->numVarsFunc);
 
 		CreateMatrixU(constInfo);
-		PrintMatrix("U", constInfo->U,
-		    constInfo->rSize, constInfo->rSize);
+		//PrintMatrix("U", constInfo->U,
+		//    constInfo->rSize, constInfo->rSize);
 
 		// CreateVecR stores the negated residual for U * step = -r.
 		CreateVecR(constInfo);
-		PrintVector("RHS (-r)", constInfo->r, constInfo->rSize);
+		//PrintVector("RHS (-r)", constInfo->r, constInfo->rSize);
 
 		// Maximum absolute residual component.
 		// The minus sign in the stored RHS does not affect this.
@@ -562,7 +872,7 @@ int OptimizeConstrained(ConstraintInfo* constInfo)
 		}
 
 		SolveStep(constInfo);
-		PrintVector("step", constInfo->step, constInfo->rSize);
+		//PrintVector("step", constInfo->step, constInfo->rSize);
 
 		len = CalcNorm2(constInfo->step, constInfo->rSize);
 		constInfo->normStep = len;
@@ -600,8 +910,17 @@ int OptimizeConstrained(ConstraintInfo* constInfo)
 		    }
 		}
 
+		// Pass the positivity-capped value into the line search.
+		constInfo->alpha = alpha;
 
-		ApplyStep(constInfo, alpha);
+		int status = CalculateStepLength(constInfo);
+
+		
+		if (status != 0)
+		    return status;
+
+		ApplyStep(constInfo, constInfo->alpha);
+
 
 		PrintVector("x after update", constInfo->x0,
 		    constInfo->numVarsFunc);
@@ -622,402 +941,84 @@ int OptimizeConstrained(ConstraintInfo* constInfo)
 	return -1;  // Iteration limit reached.
 }
 
-
-int Optimize_Steepest(EVALUATE eval, double* x0, int numVars, double stepLength, double* result)
+// Returns:
+//   0: updated
+//   1: skipped because curvature was unsuitable
+//  -1: allocation failed
+int BfgsHessianUpdate(
+    double* B,
+    const double* s,
+    const double* y,
+    size_t n)
 {
-	// Simple steepest descent algorithm. No second derivatives (Hessians)
-	// X_n+1 = X_n + h*p; p = -gradient
+    double sy = 0.0;
+    double normS = 0.0;
+    double normY = 0.0;
 
-	double res = eval(x0);
-	double* gradient_now = malloc(numVars * sizeof(double));
-	double* x_n = malloc(numVars * sizeof(double));
-	double len = 0;
-	int iterations = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        sy += s[i] * y[i];
+        normS = hypot(normS, s[i]);
+        normY = hypot(normY, y[i]);
+    }
 
-	for (int i = 0; i < numVars; ++i)
-	{
-		x_n[i] = x0[i];
-	}
+    // Require positive curvature with a relative margin.
+    const double curvatureTolerance = 1e-8;
 
-	// Step 1: get the gradient. Finite differencing for now
-	//ComputeGradient(eval, x0, numVars, gradient_now);
-	printf("Initial Gradient: %f, %f\n", gradient_now[0], gradient_now[1]);
-	printf("Initial Inputs: %f, %f\n", x_n[0], x_n[1]);
-	printf("Initial result: %f\n", eval(x_n));
+    if (!isfinite(sy) ||
+        !isfinite(normS) ||
+        !isfinite(normY) ||
+        normS == 0.0 ||
+        normY == 0.0 ||
+        sy <= curvatureTolerance * normS * normY)
+    {
+        return 1;
+    }
 
-	len = CalcNorm2(gradient_now, numVars);
+    double* Bs = malloc(n * sizeof(*Bs));
+    if (Bs == NULL)
+        return -1;
 
-	// optimize until we reach our tolerance
-	while (len > 1E-6)
-	{
-		for (int i = 0; i < numVars; ++i)
-		{
-			x_n[i] -= stepLength * gradient_now[i];
-		}
+    // Calculate B*s using the OLD matrix.
+    for (size_t i = 0; i < n; ++i)
+    {
+        Bs[i] = 0.0;
 
-		//ComputeGradient(eval, x_n, numVars, gradient_now);
-		len = CalcNorm2(gradient_now, numVars);
+        for (size_t j = 0; j < n; ++j)
+            Bs[i] += B[i*n + j] * s[j];
+    }
 
-		iterations++;
-		if(iterations % 1000 == 0)
-		{
-			printf("Iteration: %d\n", iterations);
-			printf("Gradient now: %f, %f\n", gradient_now[0], gradient_now[1]);
-			printf("x: %f, %f\n", x_n[0], x_n[1]);
-			printf("Result at x: %f\n", eval(x_n));
-			printf("Euclidian distance: %f\n\n", len);			
-		}
-	}
+    double sBs = 0.0;
 
-	for (int i = 0; i < numVars; ++i)
-	{
-		result[i] = x_n[i];
-	}
+    for (size_t i = 0; i < n; ++i)
+        sBs += s[i] * Bs[i];
 
-	printf("Iterations: %d\n", iterations);
-	
-	free(gradient_now);
-	free(x_n);
-	return 0;
-}
+    if (!isfinite(sBs) || sBs <= 0.0)
+    {
+        free(Bs);
+        return 1;
+    }
 
-int Optimize_QuasiNewton(EVALUATE eval, double* x0, int numVars, double* H0, double* result)
-{
-	double res = eval(x0);
-	double* gradient_now = malloc(numVars * sizeof(double));
-	double* gradient_past = malloc(numVars * sizeof(double));
-	double* x_n = malloc(numVars * sizeof(double));
-	double* p = malloc(numVars * sizeof(double));
-	double* x_n_past = malloc(numVars * sizeof(double));
-	double* s = malloc(numVars * sizeof(double));
-	double* y = malloc(numVars * sizeof(double));
-	double len = 0;
-	double stepLength = 1;
-	int iterations = 0;
+    // B_new = B - (Bs)(Bs)^T / (s^T Bs)
+    //           + y*y^T / (s^T y)
+    //
+    // Update one triangle and mirror it to preserve symmetry.
+    for (size_t i = 0; i < n; ++i)
+    {
+        for (size_t j = i; j < n; ++j)
+        {
+            const double value =
+                B[i*n + j]
+                - Bs[i] * Bs[j] / sBs
+                + y[i] * y[j] / sy;
 
-	SetArrayZero(s, numVars);
-	SetArrayZero(y, numVars);
-	SetArrayZero(x_n_past, numVars);
-	SetArrayZero(gradient_past, numVars);
+            B[i*n + j] = value;
+            B[j*n + i] = value;
+        }
+    }
 
-
-	// Step 1: get the gradient. Finite differencing for now
-	//ComputeGradient(eval, x0, numVars, gradient_now);
-	len = CalcNorm2(gradient_now, numVars);
-	
-	for (int i = 0; i < numVars; ++i)
-	{
-		x_n[i] = x0[i];
-		x_n_past[i] = x0[i];
-		gradient_past[i] = gradient_now[i];
-	}
-
-	printf("Initial Inputs: %f, %f\n", x_n[0], x_n[1]);
-	printf("Initial Gradient: %f, %f\n", gradient_now[0], gradient_now[1]);
-	printf("Initial result: %f\n", eval(x_n));
-
-	// NOTE(CL): We need to satisfy Wolfe conditions and also use the Hessain
-	// NOTE(CL): Hessian Update done. Works but now I need to implement line Search Algorithm with Wolfe
-	while (len > 1E-6)
-	{
-		// Compute step(fixed for now)
-		MatVecMul(H0, gradient_now, p, numVars);
-		VecScalarMult(p, -1, numVars);
-
-		// Get step Length
-		//stepLength = CalculateStepLengthArmijo(eval, x_n, p, gradient_now, numVars);
-		//stepLength = CalculateStepLengthWeakWolfe(eval, x_n, p, gradient_now, numVars);
-		stepLength = CalculateStepLengthStrongWolfe(eval, x_n, p, gradient_now, numVars);
-		printf("Step Length: %f\n", stepLength);
-		VecScalarMult(p, stepLength, numVars);
-		VecAdd(x_n, p, numVars);
-
-		// get gradient
-		//ComputeGradient(eval, x_n, numVars, gradient_now);
-		len = CalcNorm2(gradient_now, numVars);
-
-		// Calculate differences s_k and y_k
-		VecSub(gradient_now, gradient_past, y, numVars);
-		VecSub(x_n, x_n_past, s, numVars);
-
-		// Update Hessian
-		BfgsInverseUpdate(H0, s, y, numVars);
-
-		// Store previous gradient and inputs
-		for (int i = 0; i < numVars; ++i)
-		{
-			x_n_past[i] = x_n[i];
-			gradient_past[i] = gradient_now[i];
-		}
-
-		if (iterations % 10 == 0)	// Print every 10 iterations
-		{
-			printf("Iteration: %d\n", iterations);
-			printf("Gradient now: %f, %f\n", gradient_now[0], gradient_now[1]);
-			printf("x: %f, %f\n", x_n[0], x_n[1]);
-			printf("Result at x: %f\n", eval(x_n));
-			printf("Euclidian distance: %f\n\n", len);
-		}
-
-		iterations++;
-	}
-
-	for (int i = 0; i < numVars; ++i)
-	{
-		result[i] = x_n[i];
-	}
-	printf("Iterations: %d\n", iterations);
-
-	free(gradient_now);
-	free(gradient_past);
-	free(x_n);
-	free(x_n_past);
-	free(p);
-	free(s);
-	free(y);
-	return 0;
-}
-
-double CalculateStepLengthStrongWolfe(EVALUATE eval, double* x_n, double* direction, double* gradient, int numVars)
-{
-	// Here we need to find the step step length. We already have the direction sorted.
-	// To do this, we need to satisfy the Strong Wolfe condifions
-	// 1. There must be a sufficient decrease in the function value.
-	// 2. Curvature should be less than some metric.This enables us to skip the steepest bit and get near the bottom.
-
-	double c1 = 1E-4;
-	double c2 = 0.9;
-	double minStep =  1E-4;
-	double stepLength = 1.0; // Initial full step
-	double candidateStepRes1 = 0.0;
-	double candidateStepRes2 = 0.0;
-	double candidateStepCondition1 = 0.0;
-	double candidateStepCondition2 = 0.0;
-	double* candidateStep = malloc(numVars * sizeof(double));
-	double* candidateStepGrad = malloc(numVars * sizeof(double));
-	double f0 = eval(x_n);
-
-	SetArrayZero(candidateStep, numVars);
-	SetArrayZero(candidateStepGrad, numVars);
-
-	VecScalarMult2(direction, candidateStep, stepLength, numVars);
-	VecAdd(candidateStep, x_n, numVars);
-	
-	double dotGradientDirection = Dot(gradient, direction, numVars);
-	candidateStepRes1 = eval(candidateStep);
-	candidateStepCondition1 = f0 + c1*stepLength*dotGradientDirection;
-	//ComputeGradient(eval, candidateStep, numVars, candidateStepGrad);
-	candidateStepRes2 = fabs(Dot(candidateStepGrad,direction, numVars));
-	candidateStepCondition2 = c2 * fabs(dotGradientDirection);
-
-	while(candidateStepRes1 > candidateStepCondition1 || candidateStepRes2 > candidateStepCondition2)
-	{
-		stepLength *= 0.65;
-		stepLength = fmax(stepLength, minStep);
-		VecScalarMult2(direction, candidateStep, stepLength, numVars);
-		VecAdd(candidateStep, x_n, numVars);
-		//ComputeGradient(eval, candidateStep, numVars, candidateStepGrad);
-
-		candidateStepRes1 = eval(candidateStep);
-		candidateStepCondition1 = f0 + c1*stepLength*dotGradientDirection;
-		candidateStepRes2 = fabs(Dot(candidateStepGrad,direction, numVars));
-		candidateStepCondition2 = c2 * fabs(dotGradientDirection);
-
-		//printf("candidateStepRes1: %f\n", candidateStepRes1);
-		//printf("candidateStepCondition1: %f\n", candidateStepCondition1);
-		//printf("candidateStepRes2: %f\n", candidateStepRes2);
-		//printf("candidateStepCondition2: %f\n", candidateStepCondition2);
-		//printf("stepLength: %f\n", stepLength);
-		
-		if(stepLength < minStep)
-			break;	// Couldn't find a reasonable stepLength (this check might not be needed)
-	}
-
-	free(candidateStep);
-	free(candidateStepGrad);
-	return stepLength;
-}
-
-double CalculateStepLengthWeakWolfe(EVALUATE eval, double* x_n, double* direction, double* gradient, int numVars)
-{
-	// Here we need to find the step step length. We already have the direction sorted.
-	// To do this, we need to satisfy the weak Wolfe condifions
-	// 1. There must be a sufficient decrease in the function value.
-	// 2. Curvature should be less than some metric.This enables us to skip the steepest bit and get near the bottom.
-
-	double c1 = 1E-4;
-	double c2 = 0.9;
-	double minStep =  1E-4;
-	double stepLength = 1.0; // Initial full step
-	double candidateStepRes1 = 0.0;
-	double candidateStepRes2 = 0.0;
-	double candidateStepCondition1 = 0.0;
-	double candidateStepCondition2 = 0.0;
-	double* candidateStep = malloc(numVars * sizeof(double));
-	double* candidateStepGrad = malloc(numVars * sizeof(double));
-	double f0 = eval(x_n);
-
-	SetArrayZero(candidateStep, numVars);
-	SetArrayZero(candidateStepGrad, numVars);
-
-	VecScalarMult2(direction, candidateStep, stepLength, numVars);
-	VecAdd(candidateStep, x_n, numVars);
-	
-	double dotGradientDirection = Dot(gradient, direction, numVars);
-	candidateStepRes1 = eval(candidateStep);
-	candidateStepCondition1 = f0 + c1*stepLength*dotGradientDirection;
-	//ComputeGradient(eval, candidateStep, numVars, candidateStepGrad);
-	candidateStepRes2 = Dot(candidateStepGrad,direction, numVars);
-	candidateStepCondition2 = c2 * dotGradientDirection;
-
-	while(candidateStepRes1 > candidateStepCondition1 || candidateStepRes2 < candidateStepCondition2)
-	{
-		stepLength *= 0.65;
-		stepLength = fmax(stepLength, minStep);
-		VecScalarMult2(direction, candidateStep, stepLength, numVars);
-		VecAdd(candidateStep, x_n, numVars);
-		//ComputeGradient(eval, candidateStep, numVars, candidateStepGrad);
-
-		candidateStepRes1 = eval(candidateStep);
-		candidateStepCondition1 = f0 + c1*stepLength*dotGradientDirection;
-		candidateStepRes2 = Dot(candidateStepGrad,direction, numVars);
-		candidateStepCondition2 = c2 * dotGradientDirection;
-
-		//printf("candidateStepRes1: %f\n", candidateStepRes1);
-		//printf("candidateStepCondition1: %f\n", candidateStepCondition1);
-		//printf("candidateStepRes2: %f\n", candidateStepRes2);
-		//printf("candidateStepCondition2: %f\n", candidateStepCondition2);
-		//printf("stepLength: %f\n", stepLength);
-		
-		if(stepLength < minStep)
-			break;	// Couldn't find a reasonable stepLength (this check might not be needed)
-	}
-
-	free(candidateStep);
-	free(candidateStepGrad);
-	return stepLength;
-}
-
-double CalculateStepLengthArmijo(EVALUATE eval, double* x_n, double* direction, double* gradient, int numVars)
-{
-	// Here we need to find the step step length. We already have the direction sorted.
-	// To do this, we need to satisfy the Armijo condifions
-	// 1. There must be a sufficient decrease in the function value.
-
-	double c1 = 1E-4;
-	double minStep =  1E-4;
-	double stepLength = 1.0; // Initial full step
-	double candidateStepRes1 = 0.0;
-	double candidateStepCondition1 = 0.0;
-	double* candidateStep = malloc(numVars * sizeof(double));
-	double f0 = eval(x_n);
-
-	SetArrayZero(candidateStep, numVars);
-
-	VecScalarMult2(direction, candidateStep, stepLength, numVars);
-	VecAdd(candidateStep, x_n, numVars);
-	
-	double dotGradientDirection = Dot(gradient, direction, numVars);
-
-	if (dotGradientDirection >= 0.0)
-	{
-	    // Not a descent direction → fallback
-	    free(candidateStep);
-	    return 0.0;
-	}
-
-	candidateStepRes1 = eval(candidateStep);
-	candidateStepCondition1 = f0 + c1*stepLength*dotGradientDirection;
-
-	while(candidateStepRes1 > candidateStepCondition1)
-	{
-		stepLength *= 0.75; // half the step length
-		stepLength = fmax(stepLength, minStep);
-		VecScalarMult2(direction, candidateStep, stepLength, numVars);
-		VecAdd(candidateStep, x_n, numVars);
-
-		candidateStepRes1 = eval(candidateStep);
-		candidateStepCondition1 = f0 + c1*stepLength*dotGradientDirection;
-
-		//printf("candidateStepRes1: %f\n", candidateStepRes1);
-		//printf("candidateStepCondition1: %f\n", candidateStepCondition1);
-		//printf("stepLength: %f\n", stepLength);
-		
-		if(stepLength <= minStep)
-			break;	// Couldn't find a reasonable stepLength (this check might not be needed)
-	}
-
-	free(candidateStep);
-	return stepLength;
-
-}
-
-void BfgsInverseUpdate(double* H, const double* s, const double* y, size_t n)
-{
-	double d = Dot(y, s, n);
-	
-	// Temporary since line search algorithm with Wolfe Conditions will handle this
-	if (fabs(d) < 1E-12)
-	{
-		printf("BFGS: d too small: %f\n", d);
-		return;
-	}
-
-	double rho = 1.0 / d;
-
-	const size_t matSize = n * n;
-	double* I_1 = malloc(matSize * sizeof(double));
-	double* I_2 = malloc(matSize * sizeof(double));
-	double* syT = malloc(matSize * sizeof(double));
-	double* ysT = malloc(matSize * sizeof(double));
-	double* ssT = malloc(matSize * sizeof(double));
-	double* MatMultRes1 = malloc(matSize * sizeof(double));
-	double* MatMultRes2 = malloc(matSize * sizeof(double));
-
-	if (!I_1 || !I_2 || !syT || !ysT || !ssT || !MatMultRes1 || !MatMultRes2)
-	{
-		printf("Failed to malloc lol\n");
-		return;
-	}
-
-	SetArrayZero(I_1, matSize);
-	SetArrayZero(I_2, matSize);
-	SetArrayZero(syT, matSize);
-	SetArrayZero(ysT, matSize);
-	SetArrayZero(ssT, matSize);
-	SetArrayZero(MatMultRes1, matSize);
-	SetArrayZero(MatMultRes2, matSize);
-	CreateIdentityMat(I_1, n);
-	CreateIdentityMat(I_2, n);
-
-	// Compute outer products
-	OuterProduct(s, y, n, syT);
-	OuterProduct(y, s, n, ysT);
-	OuterProduct(s, s, n, ssT);
-
-	// Multiply by rho
-	MatScalarMult(syT, rho, matSize);
-	MatScalarMult(ysT, rho, matSize);
-	MatScalarMult(ssT, rho, matSize);
-
-	// Subtract from Identity
-	MatSubSame(I_1, syT, matSize);
-	MatSubSame(I_2, ysT, matSize);
-
-
-	MatMul(I_1, H, MatMultRes1, n);
-	MatMul(MatMultRes1, I_2, MatMultRes2, n);
-
-	// Put final values for new Hessian into old Hessian
-	MatAdd(MatMultRes2, ssT, H, matSize);
-	
-	free(I_1);
-	free(I_2);
-	free(syT);
-	free(ysT);
-	free(ssT);
-	free(MatMultRes1);
-	free(MatMultRes2);
+    free(Bs);
+    return 0;
 }
 
 
@@ -1032,13 +1033,13 @@ static void PrintVector(const char* name, const double* vec, size_t size)
 static void PrintMatrix(
 	const char* name, const double* mat, size_t rows, size_t cols)
 {
-	printf("%s (%zu x %zu):\n", name, rows, cols);
-	for (size_t i = 0; i < rows; ++i)
-	{
-		printf("  [");
-		for (size_t j = 0; j < cols; ++j)
-			printf("%s% .10g", j ? ", " : "", mat[i * cols + j]);
-		printf("]\n");
-	}
-	printf("\n");
+	// printf("%s (%zu x %zu):\n", name, rows, cols);
+	// for (size_t i = 0; i < rows; ++i)
+	// {
+	// 	printf("  [");
+	// 	for (size_t j = 0; j < cols; ++j)
+	// 		printf("%s% .10g", j ? ", " : "", mat[i * cols + j]);
+	// 	printf("]\n");
+	// }
+	// printf("\n");
 }

@@ -1,4 +1,4 @@
-#include "utils.h"
+#include "..\utils\utils.h"
 
 typedef double (*EVALUATE)(double*);	// Function pointer signature for functions to be evaluated
 
